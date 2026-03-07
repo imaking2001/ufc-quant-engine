@@ -12,8 +12,7 @@ from datetime import datetime
 # ==========================================
 # ⚠️ [설정] 본인 토큰 확인
 # ==========================================
-AIRTABLE_TOKEN = "pat2Gb9ZFl6W9eVhU.beaf37ed6a9eea30d5867442356757c6f12ba50c641fcb1c50e10c8a3853a929"
-BASE_ID = "appMzf13OXWbFtYnG"
+from config import AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 FIGHTERS_TABLE_NAME = "Fighters"
 HISTORY_TABLE_NAME = "Match_History"
 
@@ -54,8 +53,8 @@ def main():
     print(f"🔥 [V5.2 마스터 엔진] 상세 스탯 덮어쓰기 및 제로 스탯 방어 모드 가동...")
     
     api = Api(AIRTABLE_TOKEN)
-    f_table = api.table(BASE_ID, FIGHTERS_TABLE_NAME)
-    h_table = api.table(BASE_ID, HISTORY_TABLE_NAME)
+    f_table = api.table(AIRTABLE_BASE_ID, FIGHTERS_TABLE_NAME)
+    h_table = api.table(AIRTABLE_BASE_ID, HISTORY_TABLE_NAME)
 
     # 1. Fighter DB 로딩 및 매핑
     print("🧠 전투력(Z-Score) 맵 생성 중...")

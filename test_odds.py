@@ -1,9 +1,6 @@
 import requests
 
-# ==========================================
-# ⚠️ 여기에 방금 이메일로 받은 본인 API 키를 넣어!
-# ==========================================
-API_KEY = "2fea149fa0cdc00efe539cabc8dc34e5"
+from config import ODDS_API_KEY
 
 SPORT = "mma_mixed_martial_arts" # 격투기/UFC 코드
 REGIONS = "us" # 미국 마켓 (DraftKings, BetMGM 등 기준)
@@ -15,7 +12,7 @@ def test_odds_api():
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds/"
     
     params = {
-        "apiKey": API_KEY,
+        "apiKey": ODDS_API_KEY,
         "regions": REGIONS,
         "markets": MARKETS,
         "oddsFormat": ODDS_FORMAT,

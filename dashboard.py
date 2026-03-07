@@ -5,10 +5,7 @@ import unicodedata
 import re
 from datetime import datetime, timedelta, timezone
 
-# ==========================================
-# 🔑 여기에 본인 The Odds API 키를 넣어!
-# ==========================================
-API_KEY = "2fea149fa0cdc00efe539cabc8dc34e5"
+from config import ODDS_API_KEY
 
 # --- 🛠️ 이름 정제 및 매칭 코어 로직 ---
 def get_unified_name(name):
@@ -62,7 +59,7 @@ def get_kor_category(ranking_str):
 @st.cache_data(ttl=3600) 
 def get_upcoming_matchups():
     url = f"https://api.the-odds-api.com/v4/sports/mma_mixed_martial_arts/odds/"
-    params = {"apiKey": API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "decimal"}
+    params = {"apiKey": ODDS_API_KEY, "regions": "us", "markets": "h2h", "oddsFormat": "decimal"}
     
     try:
         res = requests.get(url, params=params)

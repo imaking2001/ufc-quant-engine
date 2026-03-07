@@ -8,9 +8,7 @@ from pyairtable import Api
 from pyairtable.formulas import match
 
 # ================= ⚙️ 개인 설정 =================
-DIFY_API_KEY = "app-NGiqAIfsPXSEMKARQGLTlTFn"
-AIRTABLE_TOKEN = "pat2Gb9ZFl6W9eVhU.beaf37ed6a9eea30d5867442356757c6f12ba50c641fcb1c50e10c8a3853a929"
-BASE_ID = "appMzf13OXWbFtYnG"
+from config import DIFY_API_KEY, AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 FIGHTERS_TABLE = "Fighters"
 HISTORY_TABLE = "Match_History"
 PREDICTIONS_TABLE = "Predictions"
@@ -28,9 +26,9 @@ TIER_1_LEAGUES = ['bellator', 'pfl', 'strikeforce', 'wec', 'glory', 'one']
 TIER_2_LEAGUES = ['ksw', 'cagewarriors', 'aca', 'rizin', 'lfa', 'invicta']
 
 api = Api(AIRTABLE_TOKEN)
-f_table = api.table(BASE_ID, FIGHTERS_TABLE)
-h_table = api.table(BASE_ID, HISTORY_TABLE)
-p_table = api.table(BASE_ID, PREDICTIONS_TABLE)
+f_table = api.table(AIRTABLE_BASE_ID, FIGHTERS_TABLE)
+h_table = api.table(AIRTABLE_BASE_ID, HISTORY_TABLE)
+p_table = api.table(AIRTABLE_BASE_ID, PREDICTIONS_TABLE)
 
 def get_latest_ufc_event():
     print("🌐 UFC 공식 일정 확인 중...")

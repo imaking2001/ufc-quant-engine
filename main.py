@@ -8,8 +8,7 @@ from ufc_updater import (
 # ==========================================
 # ⚠️ [설정] 본인 토큰 및 베이스 정보
 # ==========================================
-AIRTABLE_TOKEN = "pat2Gb9ZFl6W9eVhU.beaf37ed6a9eea30d5867442356757c6f12ba50c641fcb1c50e10c8a3853a929"
-BASE_ID = "appMzf13OXWbFtYnG"
+from config import AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 FIGHTERS_TABLE_NAME = "Fighters"
 HISTORY_TABLE_NAME = "Match_History"
 
@@ -17,8 +16,8 @@ def main():
     print("🔥 [마스터 파이프라인] UFC 데이터 통합 업데이트 시작...")
     
     api = Api(AIRTABLE_TOKEN)
-    f_table = api.table(BASE_ID, FIGHTERS_TABLE_NAME)
-    h_table = api.table(BASE_ID, HISTORY_TABLE_NAME)
+    f_table = api.table(AIRTABLE_BASE_ID, FIGHTERS_TABLE_NAME)
+    h_table = api.table(AIRTABLE_BASE_ID, HISTORY_TABLE_NAME)
 
     # 1. 공식 랭킹 동기화 및 신규 랭커 탐지
     update_official_rankings(f_table)
