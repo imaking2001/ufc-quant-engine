@@ -15,6 +15,29 @@ from config import ODDS_API_KEY
 SPORT = "mma_mixed_martial_arts"
 LOOKAHEAD_DAYS = 8  # 이번 주 경기만 분석
 
+# ==========================================
+# 🗓️ UFC 이벤트 캘린더
+# - 현지 기준 날짜 1개만 저장
+# - UFC 전용 분석이므로 Promotion/Card_Type 제거
+# ==========================================
+EVENT_CALENDAR = [
+    {
+        "event_name": "UFC 326: Oliveira vs Holloway",
+        "event_date": "2026-03-07",  # 현지 기준 날짜
+        "utc_start": "2026-03-07T21:00:00Z",
+        "utc_end": "2026-03-08T06:30:00Z",
+    },
+    {
+        "event_name": "UFC Fight Night: Johnson vs Silva",
+        "event_date": "2026-03-14",
+        "utc_start": "2026-03-14T18:00:00Z",
+        "utc_end": "2026-03-15T05:30:00Z",
+    },
+]
+
+def parse_utc(iso_str: str) -> datetime:
+    """Z 포함 ISO 문자열을 UTC datetime으로 변환"""
+    return datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
 
 def get_unified_name(name: str) -> str:
     """표기 오류 방어용: 이름을 영문/숫자만 남긴 압축 키로 변환"""
@@ -24,7 +47,6 @@ def get_unified_name(name: str) -> str:
     n = unicodedata.normalize('NFKD', n).encode('ASCII', 'ignore').decode('utf-8')
     n = re.sub(r'[^a-z0-9]', '', n)
     return n
-
 
 def get_airtable_fighters_map() -> Dict[str, Dict[str, str]]:
     """Airtable Fighters를 {압축이름: {name, ranking, id}} 형태로 캐싱"""
@@ -42,7 +64,6 @@ def get_airtable_fighters_map() -> Dict[str, Dict[str, str]]:
             }
     return f_map
 
-
 def find_matching_fighter(api_name: str, db_map: Dict[str, Dict[str, str]]) -> Optional[Dict[str, str]]:
     """API 이름과 DB 이름을 비교해서 가장 가까운 선수를 반환"""
     api_uni = get_unified_name(api_name)
@@ -58,9 +79,34 @@ def find_matching_fighter(api_name: str, db_map: Dict[str, Dict[str, str]]) -> O
                 return data
     return None
 
+def get_event_meta(match_time: Optional[datetime]) -> Dict[str, str]:
+    """
+    경기 시간(UTC)을 기반으로 어떤 UFC 이벤트에 속하는지 판정
+    - 매칭되면 이벤트명 + 현지 날짜 반환
+    - 못 찾으면 Unknown 처리
+    """
+    if not match_time:
+        return {
+            "event_name": "UNKNOWN EVENT",
+            "event_date": "Unknown",
+        }
+
+    for event in EVENT_CALENDAR:
+        start_utc = parse_utc(event["utc_start"])
+        end_utc = parse_utc(event["utc_end"])
+        if start_utc <= match_time <= end_utc:
+            return {
+                "event_name": event["event_name"],
+                "event_date": event["event_date"],
+            }
+
+    return {
+        "event_name": f"UNMAPPED EVENT | {match_time.strftime('%Y-%m-%d')}",
+        "event_date": match_time.strftime("%Y-%m-%d"),
+    }
 
 def get_upcoming_matchups() -> List[Dict]:
-    """The Odds API에서 이번 주 UFC/MMA 매치업을 가져오고 DB 선수명으로 정규화"""
+    """The Odds API에서 이번 주 MMA 매치업을 가져오고 DB 선수명으로 정규화"""
     url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds/"
     params = {
         "apiKey": ODDS_API_KEY,
@@ -117,83 +163,111 @@ def get_upcoming_matchups() -> List[Dict]:
             print(f"⚠️ 스킵: 배당률 없음 -> {f_a_api} vs {f_b_api}")
             continue
 
-        event_label_time = commence_time_str.replace("T", " ").replace("Z", " UTC") if commence_time_str else "시간미정"
-        event_name = f"AUTO | {f_a_data['name']} vs {f_b_data['name']} | {event_label_time}"
+        event_meta = get_event_meta(match_time)
 
         matchups.append(
             {
-                "event_name": event_name,
+                "event_name": event_meta["event_name"],   # 진짜 UFC 이벤트명
+                "event_date": event_meta["event_date"],   # 현지 기준 날짜
                 "fighter_a": f_a_data["name"],
                 "fighter_b": f_b_data["name"],
                 "fighter_a_id": f_a_data["id"],
                 "fighter_b_id": f_b_data["id"],
                 "odds_a": float(odds_a),
                 "odds_b": float(odds_b),
+                "commence_time_utc": commence_time_str,
             }
         )
 
     print(f"✅ 자동 분석 대상 경기 {len(matchups)}개 확보 완료")
     return matchups
 
-
-def prediction_exists(event_name: str, target_id: str, opponent_id: str) -> bool:
-    """같은 이벤트/같은 페어가 이미 Predictions에 있으면 중복 저장 방지"""
+def prediction_exists(event_name: str, fighter_a_id: str, fighter_b_id: str) -> bool:
+    """
+    같은 이벤트 안에서 같은 두 선수 조합이 이미 있으면 중복 저장 방지
+    - 타겟/상대 방향이 바뀌어도 같은 경기로 취급
+    """
     try:
         records = pred.p_table.all(formula=match({"Event_Name": event_name}))
+        target_pair = {fighter_a_id, fighter_b_id}
+
         for r in records:
             fields = r.get("fields", {})
             main_ids = fields.get("Main_Fighter", [])
             opp_ids = fields.get("Opponent", [])
-            if main_ids and opp_ids and main_ids[0] == target_id and opp_ids[0] == opponent_id:
-                return True
+
+            if main_ids and opp_ids:
+                existing_pair = {main_ids[0], opp_ids[0]}
+                if existing_pair == target_pair:
+                    return True
     except Exception as e:
         print(f"⚠️ 중복 체크 중 에러(일단 계속 진행): {e}")
     return False
 
-
-def save_prediction(event_name: str, res: Dict, dify_json: Dict, A_quant: Dict, B_quant: Dict, odds_a: float, odds_b: float) -> bool:
-    """수동 Predictions.py와 동일한 필드 구조로 Airtable Predictions 저장"""
+def save_prediction(matchup: Dict, res: Dict, dify_json: Dict, A_quant: Dict, B_quant: Dict) -> bool:
+    """자동 예측 결과를 Airtable Predictions 테이블에 저장"""
     if "PASS" in res["Target"]:
-        print(f"⏭️ PASS 경기 스킵: {A_quant['name']} vs {B_quant['name']} -> {res['Target']}")
+        print(f"⏭️ PASS 경기 스킵: {matchup['fighter_a']} vs {matchup['fighter_b']} -> {res['Target']}")
         return False
 
     try:
         scenario = dify_json.get("analysis", {}).get("key_scenario", "시나리오 분석 실패")
-        safe_note = f"✅ 모델 엣지: {res['Edge']:.1%}\n{scenario}"
+        safe_note = (
+            f"이벤트: {matchup['event_name']}\n"
+            f"현지 이벤트 날짜: {matchup['event_date']}\n"
+            f"경기: {matchup['fighter_a']} vs {matchup['fighter_b']}\n"
+            f"모델 엣지: {res['Edge']:.1%}\n"
+            f"핵심 시나리오: {scenario}"
+        )
 
+        # 타겟 쪽 기준으로 저장
         if res["Target"] == res["A_name"]:
             target_id = A_quant["id"]
             opponent_id = B_quant["id"]
             target_prob = res["A_prob"]
-            target_odds = odds_a
+            target_odds = matchup["odds_a"]
         else:
             target_id = B_quant["id"]
             opponent_id = A_quant["id"]
             target_prob = res["B_prob"]
-            target_odds = odds_b
+            target_odds = matchup["odds_b"]
 
-        if prediction_exists(event_name, target_id, opponent_id):
-            print(f"⚠️ 이미 저장된 예측이라 스킵: {event_name} / {res['Target']}")
+        # 같은 이벤트 / 같은 경기 조합이면 저장하지 않음
+        if prediction_exists(matchup["event_name"], A_quant["id"], B_quant["id"]):
+            print(f"⚠️ 이미 저장된 경기라 스킵: {matchup['event_name']} / {matchup['fighter_a']} vs {matchup['fighter_b']}")
             return False
 
-        pred.p_table.create(
-            {
-                "Event_Name": event_name,
-                "Main_Fighter": [target_id],
-                "Opponent": [opponent_id],
-                "My_Win_Prob": float(round(target_prob, 4)),
-                "Market_Odds": float(target_odds),
-                "Bet_Amount_Unit": float(res["Unit"]),
-                "Analysis_Note": safe_note,
-            }
+        core_payload = {
+            "Event_Name": matchup["event_name"],               # 진짜 이벤트명
+            "Main_Fighter": [target_id],
+            "Opponent": [opponent_id],
+            "My_Win_Prob": float(round(target_prob, 4)),
+            "Market_Odds": float(target_odds),
+            "Bet_Amount_Unit": float(res["Unit"]),
+            "Analysis_Note": safe_note,
+        }
+
+        # Event_Date 칼럼이 Airtable에 있으면 같이 저장
+        extended_payload = {
+            **core_payload,
+            "Event_Date": matchup["event_date"],
+        }
+
+        try:
+            pred.p_table.create(extended_payload)
+        except Exception as e:
+            print(f"⚠️ Event_Date 필드 저장 실패 -> 기존 핵심 필드만 재시도: {e}")
+            pred.p_table.create(core_payload)
+
+        print(
+            f"💾 저장 완료: 이벤트={matchup['event_name']} / 날짜={matchup['event_date']} "
+            f"/ 타겟={res['Target']} / Unit={res['Unit']}"
         )
-        print(f"💾 저장 완료: {event_name} / 타겟={res['Target']} / Unit={res['Unit']}")
         return True
 
     except Exception as e:
         print(f"❌ Predictions 저장 실패: {e}")
         return False
-
 
 def run_auto_predictions():
     print("🔥 [토요일 자동 예측 배치] 시작")
@@ -210,6 +284,8 @@ def run_auto_predictions():
     for idx, m in enumerate(matchups, start=1):
         print("\n" + "=" * 70)
         print(f"[{idx}/{len(matchups)}] 🥊 {m['fighter_a']} vs {m['fighter_b']}")
+        print(f"   ↳ 이벤트: {m['event_name']}")
+        print(f"   ↳ 현지 이벤트 날짜: {m['event_date']}")
         print(f"   ↳ 배당률: {m['fighter_a']} {m['odds_a']} / {m['fighter_b']} {m['odds_b']}")
 
         try:
@@ -249,13 +325,11 @@ def run_auto_predictions():
                 continue
 
             ok = save_prediction(
-                event_name=m["event_name"],
+                matchup=m,
                 res=res,
                 dify_json=dify_json,
                 A_quant=A_quant,
                 B_quant=B_quant,
-                odds_a=m["odds_a"],
-                odds_b=m["odds_b"],
             )
             if ok:
                 saved_count += 1
@@ -272,7 +346,6 @@ def run_auto_predictions():
     print(f"✅ 저장 성공: {saved_count}건")
     print(f"⏭️ PASS/보류: {pass_count}건")
     print(f"❌ 실패: {fail_count}건")
-
 
 if __name__ == "__main__":
     run_auto_predictions()
