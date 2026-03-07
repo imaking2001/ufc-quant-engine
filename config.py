@@ -3,10 +3,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
-AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-DIFY_API_KEY = os.getenv("DIFY_API_KEY")
+ODDS_API_KEY = (os.getenv("ODDS_API_KEY") or "").strip()
+AIRTABLE_TOKEN = (os.getenv("AIRTABLE_TOKEN") or "").strip()
+AIRTABLE_BASE_ID = (os.getenv("AIRTABLE_BASE_ID") or "").strip()
+DIFY_API_KEY = (os.getenv("DIFY_API_KEY") or "").strip()
 
 missing = []
 
