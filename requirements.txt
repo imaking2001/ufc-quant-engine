@@ -6,3 +6,4 @@ pandas
 numpy
 selenium
 webdriver-manager
+python-dotenv

@@ -22,17 +22,242 @@ api = Api(AIRTABLE_TOKEN)
 f_table = api.table(AIRTABLE_BASE_ID, FIGHTERS_TABLE)
 h_table = api.table(AIRTABLE_BASE_ID, HISTORY_TABLE)
 
+
 # ==========================================
-# 🎯 2. 유망주 타깃 명단
+# 🔎 공통 헬퍼
 # ==========================================
-TARGET_FIGHTERS = [
-    "Michael Johnson",
-    "Jesus Santos Aguilar",
-    "Nyamjargal Tumendemberel",
-    "Raul Rosas Jr"
-]
+def is_ranked_or_gatekeeper(ranking_value: str) -> bool:
+    """
+    네 프로젝트 기준:
+    - Champion
+    - 숫자 랭커
+    - Gatekeeper
+    만 '검증된 상대'로 본다.
+    """
+    if not ranking_value:
+        return False
+
+    r = str(ranking_value).strip().lower()
+
+    if r == "champion":
+        return True
+    if r.isdigit():
+        return True
+    if "gatekeeper" in r:
+        return True
+
+    return False
 
 
+def find_existing_record_by_name(name: str, indexed_records: list):
+    """
+    Airtable Fighters 기존 레코드와 이름 매칭
+    - 토큰 완전일치 우선
+    - 교집합 2개 이상이면 동일 인물로 간주
+    """
+    target_tokens = get_name_tokens(name)
+
+    for rec in indexed_records:
+        rec_tokens = rec["tokens"]
+        if not rec_tokens:
+            continue
+
+        if target_tokens == rec_tokens:
+            return rec
+
+        if len(target_tokens.intersection(rec_tokens)) >= 2:
+            return rec
+
+    return None
+
+
+def build_fighter_index(existing_records: list):
+    """
+    Airtable Fighters 레코드를 이름 매칭용 인덱스로 변환
+    """
+    indexed = []
+    for r in existing_records:
+        fields = r.get("fields", {})
+        indexed.append(
+            {
+                "id": r["id"],
+                "name": fields.get("Name", ""),
+                "tokens": get_name_tokens(fields.get("Name", "")),
+                "ranking": fields.get("Current_Ranking", ""),
+                "url": fields.get("UFC_Stats_URL", ""),
+            }
+        )
+    return indexed
+
+
+# ==========================================
+# 🌐 UFC Stats 이벤트 스캔
+# ==========================================
+def get_event_url(mode="upcoming"):
+    """
+    UFC Stats 이벤트 페이지에서 가장 첫 번째 대회(Upcoming 또는 최신 Completed) 추출
+    🚨 테이블 헤더 무시하고 실제 링크(event-details) 바로 타겟팅하도록 수정됨
+    """
+    if mode == "upcoming":
+        page_url = "http://ufcstats.com/statistics/events/upcoming"
+    else:
+        page_url = "http://ufcstats.com/statistics/events/completed"
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(page_url, headers=headers, timeout=20)
+        res.raise_for_status()
+
+        soup = BeautifulSoup(res.text, "html.parser")
+        
+        # 껍데기 헤더(tr)를 무시하고, 실제 대회 링크(a 태그 중 event-details 포함)를 바로 찾기
+        event_link = soup.select_one("a[href*='event-details']")
+        
+        if not event_link:
+            return None, None
+
+        event_name = event_link.get_text(strip=True)
+        event_url = event_link.get("href")
+
+        return event_name, event_url
+
+    except Exception as e:
+        print(f"❌ 이벤트 URL 조회 실패 ({mode}): {e}")
+        return None, None
+
+
+def extract_fight_pairs_from_event(event_url: str):
+    """
+    이벤트 상세 페이지에서 전체 매치업 추출
+    반환 형식:
+    [
+      {"fighter_a": "...", "fighter_b": "..."},
+      ...
+    ]
+    """
+    headers = {"User-Agent": "Mozilla/5.0"}
+
+    try:
+        res = requests.get(event_url, headers=headers, timeout=20)
+        res.raise_for_status()
+        soup = BeautifulSoup(res.text, "html.parser")
+
+        fight_pairs = []
+        seen_pairs = set()
+
+        rows = soup.select("tr.b-fight-details__table-row")
+
+        for row in rows:
+            fighter_links = row.select("a[href*='fighter-details']")
+            fighter_names = [a.get_text(strip=True) for a in fighter_links if a.get_text(strip=True)]
+
+            if len(fighter_names) >= 2:
+                fighter_a = fighter_names[0]
+                fighter_b = fighter_names[1]
+
+                pair_key = tuple(sorted([fighter_a.lower(), fighter_b.lower()]))
+                if pair_key in seen_pairs:
+                    continue
+
+                seen_pairs.add(pair_key)
+                fight_pairs.append(
+                    {
+                        "fighter_a": fighter_a,
+                        "fighter_b": fighter_b,
+                    }
+                )
+
+        return fight_pairs
+
+    except Exception as e:
+        print(f"❌ 이벤트 상세 페이지 파싱 실패: {e}")
+        return []
+
+
+def get_this_week_fighters():
+    """
+    이번 주 카드(우선 upcoming, 없으면 completed fallback)의
+    전체 매치업을 가져온다.
+    """
+    print("🌐 이번 주 UFC 카드 자동 스캔 중...")
+
+    event_name, event_url = get_event_url("upcoming")
+
+    # upcoming이 비어 있거나 실패하면 fallback
+    if not event_url:
+        print("⚠️ Upcoming 이벤트 조회 실패 → 최근 완료 대회 fallback")
+        event_name, event_url = get_event_url("completed")
+
+    if not event_url:
+        print("❌ 스캔 가능한 UFC 이벤트를 찾지 못함")
+        return None, []
+
+    fight_pairs = extract_fight_pairs_from_event(event_url)
+
+    print(f"✅ 대상 이벤트: {event_name}")
+    print(f"✅ 감지된 매치업 수: {len(fight_pairs)}")
+
+    return event_name, fight_pairs
+
+
+# ==========================================
+# 🎯 동적 Prospect 타깃 생성
+# ==========================================
+def get_dynamic_targets():
+    """
+    네 프로젝트 기준:
+    - DB에 없는 선수
+    - 상대는 DB에 있음
+    - 그 상대가 랭커/게이트키퍼
+    인 경우만 Prospect 후보로 본다.
+    """
+    print("\n🎯 [Dynamic Targeting] 이번 주 카드 기준 prospect 후보 선별 중...")
+
+    event_name, fight_pairs = get_this_week_fighters()
+    if not fight_pairs:
+        print("❌ 이벤트 매치업이 없어 동적 타깃 생성 불가")
+        return []
+
+    try:
+        existing_records = f_table.all()
+    except Exception as e:
+        print(f"❌ Airtable Fighters 조회 실패: {e}")
+        return []
+
+    indexed_records = build_fighter_index(existing_records)
+    dynamic_targets = []
+    seen_tokens = set()
+
+    for pair in fight_pairs:
+        fighter_a = pair["fighter_a"]
+        fighter_b = pair["fighter_b"]
+
+        rec_a = find_existing_record_by_name(fighter_a, indexed_records)
+        rec_b = find_existing_record_by_name(fighter_b, indexed_records)
+
+        # A는 DB에 없고, B는 DB에 있고, B가 랭커/게이트키퍼
+        if rec_a is None and rec_b is not None and is_ranked_or_gatekeeper(rec_b["ranking"]):
+            tokens_a = frozenset(get_name_tokens(fighter_a))
+            if tokens_a not in seen_tokens:
+                dynamic_targets.append(fighter_a)
+                seen_tokens.add(tokens_a)
+                print(f"   ➔ Prospect 후보 추가: {fighter_a} (상대: {rec_b['name']} / {rec_b['ranking']})")
+
+        # B는 DB에 없고, A는 DB에 있고, A가 랭커/게이트키퍼
+        if rec_b is None and rec_a is not None and is_ranked_or_gatekeeper(rec_a["ranking"]):
+            tokens_b = frozenset(get_name_tokens(fighter_b))
+            if tokens_b not in seen_tokens:
+                dynamic_targets.append(fighter_b)
+                seen_tokens.add(tokens_b)
+                print(f"   ➔ Prospect 후보 추가: {fighter_b} (상대: {rec_a['name']} / {rec_a['ranking']})")
+
+    print(f"✅ 최종 동적 타깃 수: {len(dynamic_targets)}명")
+    return dynamic_targets
+
+
+# ==========================================
+# 🔗 UFC Stats 검색
+# ==========================================
 def search_fighter_url(name):
     """
     UFC 검색창의 한계를 뚫는 우회 검색 로직
@@ -67,12 +292,10 @@ def search_fighter_url(name):
         for row in rows:
             cols = row.select("td")
 
-            # 실제 데이터가 있는 행만 처리
             if len(cols) > 1 and cols[0].find("a"):
                 found = cols[0].get_text(strip=True) + " " + cols[1].get_text(strip=True)
                 found_tokens = get_name_tokens(found)
 
-                # 이름이 같거나 토큰 교집합이 충분하면 같은 인물로 간주
                 if target_tokens == found_tokens or len(target_tokens.intersection(found_tokens)) >= 2:
                     return cols[0].find("a")["href"]
 
@@ -86,10 +309,13 @@ def search_fighter_url(name):
     return None
 
 
+# ==========================================
+# 🧬 Prospect 적재
+# ==========================================
 def add_target_prospects():
     """
-    타깃 유망주를 UFC Stats에서 찾아 Airtable Fighters 테이블에 적재
-    이미 있으면 패스
+    동적으로 선별된 prospect 후보를 UFC Stats에서 찾아
+    Airtable Fighters 테이블에 적재
     """
     print("🔄 에어테이블 기존 명단 확인 중...")
 
@@ -98,16 +324,24 @@ def add_target_prospects():
     except Exception as e:
         print(f"❌ Airtable 기존 데이터 조회 실패: {e}")
         print("   ➔ Airtable 토큰, Base ID, Fighters 테이블명 확인 필요")
-        return False
+        return False, 0
 
     existing_tokens_list = [
         get_name_tokens(r["fields"].get("Name", ""))
         for r in existing_records
     ]
 
-    print(f"🔫 [유망주 스나이퍼 가동] 총 {len(TARGET_FIGHTERS)}명의 타깃 추적 시작...")
+    dynamic_targets = get_dynamic_targets()
 
-    for name in TARGET_FIGHTERS:
+    if not dynamic_targets:
+        print("ℹ️ 이번 주 카드 기준으로 신규 prospect 타깃 없음")
+        return True, 0
+
+    print(f"\n🔫 [유망주 스나이퍼 가동] 총 {len(dynamic_targets)}명의 동적 타깃 추적 시작...")
+
+    added_count = 0
+
+    for name in dynamic_targets:
         print(f"\n🔍 타깃: {name}")
         target_tokens = get_name_tokens(name)
 
@@ -163,19 +397,18 @@ def add_target_prospects():
                 if "TD Avg.:" in txt:
                     upd["TD_Avg"] = clean_float(txt.replace("TD Avg.:", ""))
                 if "TD Acc.:" in txt:
+                    # 🚨 딕셔너리 키 오타 수정 완료
                     upd["TD_Acc"] = clean_percent(txt.replace("TD Acc.:", ""))
                 if "TD Def.:" in txt:
                     upd["TD_Def"] = clean_percent(txt.replace("TD Def.:", ""))
                 if "Sub. Avg.:" in txt:
                     upd["Sub_Avg"] = clean_float(txt.replace("Sub. Avg.:", ""))
 
-            # 체급이 비어 있으면 weight 기반으로 추정
             if not upd.get("Weight_Class"):
                 gc = guess_weight_class(weight_lbs)
                 if gc != "Unknown":
                     upd["Weight_Class"] = gc
 
-            # 경기 수 카운트
             upd["UFC_Fights"] = sum(
                 1 for row in soup.select("tr.b-fight-details__table-row") if row.find("td")
             )
@@ -184,6 +417,7 @@ def add_target_prospects():
             print(f"   ➔ ✅ [유망주 적재 완료] {name} (체급: {upd.get('Weight_Class', '확인불가')})")
 
             existing_tokens_list.append(target_tokens)
+            added_count += 1
 
         except requests.exceptions.Timeout:
             print("   ➔ ❌ 크롤링 에러: UFC Stats 페이지 응답 timeout")
@@ -192,13 +426,15 @@ def add_target_prospects():
         except Exception as e:
             print(f"   ➔ ❌ 크롤링/업로드 에러: {e}")
 
-        # 서버 과부하 방지
         time.sleep(1)
 
-    print("\n🏁 유망주 적재 단계 완료")
-    return True
+    print(f"\n🏁 유망주 적재 단계 완료 (신규 적재: {added_count}명)")
+    return True, added_count
 
 
+# ==========================================
+# 📊 Z-Score 재계산
+# ==========================================
 def update_z_scores_only():
     """
     Fighters + Match_History를 바탕으로
@@ -222,7 +458,6 @@ def update_z_scores_only():
         print("❌ Fighters 테이블이 비어 있음. 계산 중단.")
         return False
 
-    # 계산에 필요한 칼럼이 없으면 기본 생성
     required_fighter_cols = ["Current_Ranking", "Weight_Class", "SLpM", "TD_Avg", "TD_Def", "Str_Def"]
     for col in required_fighter_cols:
         if col not in df_f.columns:
@@ -271,7 +506,6 @@ def update_z_scores_only():
     if not df_h.empty and "Fighter" in df_h.columns:
         df_h["f_id"] = df_h["Fighter"].apply(lambda x: x[0] if isinstance(x, list) else x)
 
-        # 필요한 칼럼이 없는 경우 방어
         for col in ["True_Str_Landed", "True_TD_Landed", "True_TD_Defended", "True_Str_Defended"]:
             if col not in df_h.columns:
                 df_h[col] = np.nan
@@ -353,17 +587,25 @@ def update_z_scores_only():
     return True
 
 
+# ==========================================
+# 🚀 실행 파이프라인
+# ==========================================
 def run_prospect_pipeline():
     """
     유망주 전용 통합 파이프라인
-    1. 타깃 유망주를 Fighters 테이블에 적재
-    2. 적재 후 z-score 재계산
+    1. 이번 주 카드 기준 dynamic prospect 추출
+    2. Fighters 테이블 적재
+    3. 적재된 경우 z-score 재계산
     """
     print("🔥 [유망주 통합 파이프라인] 시작")
 
-    add_ok = add_target_prospects()
+    add_ok, added_count = add_target_prospects()
     if not add_ok:
         print("❌ 유망주 적재 단계에서 실패. Z-Score 계산은 생략.")
+        return
+
+    if added_count == 0:
+        print("ℹ️ 신규 prospect 적재가 없어서 Z-Score 재계산은 생략.")
         return
 
     z_ok = update_z_scores_only()
