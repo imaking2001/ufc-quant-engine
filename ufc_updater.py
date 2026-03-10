@@ -1,5 +1,4 @@
 import time
-import urllib.parse
 import requests
 import pandas as pd
 import numpy as np
@@ -11,7 +10,6 @@ from pyairtable import Api
 
 from config import AIRTABLE_TOKEN, AIRTABLE_BASE_ID
 from ufc_utils import *
-
 from fighter_identity import (
     build_fighter_index,
     find_existing_record_by_name,
@@ -30,11 +28,23 @@ api = Api(AIRTABLE_TOKEN)
 f_table = api.table(AIRTABLE_BASE_ID, FIGHTERS_TABLE)
 h_table = api.table(AIRTABLE_BASE_ID, HISTORY_TABLE)
 
+# ==========================================
+# ⚙️ 정책 상수
+# ==========================================
+# Gatekeeper는 "자주 보인 선수"가 아니라 "실제로 검증된 중간층"만 남기도록 강화
+GATEKEEPER_MIN_UFC_FIGHTS = 5
+GATEKEEPER_TOTAL_EXPOSURE_THRESHOLD = 3
+GATEKEEPER_BENCHMARK_EXPOSURE_THRESHOLD = 2
+GATEKEEPER_RANKED_EXPOSURE_THRESHOLD = 1
+
+# Prospect는 아직 검증 전 단계로 제한
+PROSPECT_MAX_UFC_FIGHTS = 5
+
+# benchmark(Z-score 평균/표준편차) 계산 시에만 적용
+BENCHMARK_RECENCY_DAYS = 730
+
 
 def get_chrome_driver():
-    """
-    GitHub Actions/로컬 겸용 크롬 드라이버
-    """
     options = webdriver.ChromeOptions()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -46,39 +56,28 @@ def get_chrome_driver():
 
     return webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
-        options=options
+        options=options,
     )
 
 
 def is_ranked_or_champion(ranking_value: str) -> bool:
     if not ranking_value:
         return False
-
     r = str(ranking_value).strip().lower()
-    if r == "champion":
-        return True
-    if r.isdigit():
-        return True
-    return False
+    return r == "champion" or r.isdigit()
 
 
-def is_promotable_to_gatekeeper(ranking_value: str) -> bool:
-    """
-    Prospect / Unranked / 빈칸만 Gatekeeper 승격 허용
-    """
+def is_gatekeeper(ranking_value: str) -> bool:
     if not ranking_value:
-        return True
-
-    r = str(ranking_value).strip().lower()
-
-    if r in ["prospect", "unranked", ""]:
-        return True
-    if r == "champion" or r.isdigit():
         return False
-    if "gatekeeper" in r:
-        return False
+    return "gatekeeper" in str(ranking_value).strip().lower()
 
-    return False
+
+def safe_int(value, default=0):
+    try:
+        return int(float(value))
+    except Exception:
+        return default
 
 
 def safe_create_fighter(payload):
@@ -111,9 +110,145 @@ def safe_update_fighter(record_id, payload):
         raise
 
 
-def update_official_rankings(f_table):
+def names_match(name_a: str, name_b: str) -> bool:
+    tokens_a = get_name_tokens(name_a)
+    tokens_b = get_name_tokens(name_b)
+
+    if not tokens_a or not tokens_b:
+        return False
+
+    if tokens_a == tokens_b:
+        return True
+
+    return len(tokens_a.intersection(tokens_b)) >= 2
+
+
+def get_name_key(name: str):
+    tokens = sorted(get_name_tokens(name))
+    return tuple(tokens)
+
+
+def empty_exposure_summary(display_name=""):
+    return {
+        "display_name": display_name,
+        "total_count": 0,
+        "benchmark_exposure_count": 0,
+        "ranked_exposure_count": 0,
+    }
+
+
+def qualifies_gatekeeper(summary: dict, ufc_fights: int) -> bool:
     """
-    1. UFC 공식 랭킹 스크래핑 및 신규 랭커 추가 + 기존 랭커 업데이트
+    강화된 Gatekeeper 기준
+    1) UFC 5전 이상
+    2) Match_History 상대 이름 총 3회 이상 등장
+    3) benchmark(Champion/Ranked/Gatekeeper) 선수와 2회 이상 연결
+    4) 그중 최소 1회는 공식 랭커/챔피언과 연결
+    """
+    return (
+        ufc_fights >= GATEKEEPER_MIN_UFC_FIGHTS
+        and summary.get("total_count", 0) >= GATEKEEPER_TOTAL_EXPOSURE_THRESHOLD
+        and summary.get("benchmark_exposure_count", 0) >= GATEKEEPER_BENCHMARK_EXPOSURE_THRESHOLD
+        and summary.get("ranked_exposure_count", 0) >= GATEKEEPER_RANKED_EXPOSURE_THRESHOLD
+    )
+
+
+def qualifies_prospect(summary: dict, ufc_fights: int, current_rank: str) -> bool:
+    """
+    Prospect 기준
+    - 아직 Gatekeeper가 아님
+    - UFC 5전 이하
+    - benchmark 상대와 최소 1회 연결
+    """
+    r = str(current_rank or "").strip().lower()
+
+    if ufc_fights <= 0 or ufc_fights > PROSPECT_MAX_UFC_FIGHTS:
+        return False
+
+    if summary.get("benchmark_exposure_count", 0) >= 1:
+        return True
+
+    # 기존 Prospect는 너무 쉽게 날리지 않도록 완충
+    if r == "prospect":
+        return True
+
+    return False
+
+
+def get_target_rank_for_nonranked_fighter(fields: dict, summary: dict) -> str:
+    current_rank = str(fields.get("Current_Ranking", "")).strip()
+    ufc_fights = safe_int(fields.get("UFC_Fights", 0), 0)
+
+    if qualifies_gatekeeper(summary, ufc_fights):
+        return "Gatekeeper"
+
+    if qualifies_prospect(summary, ufc_fights, current_rank):
+        return "Prospect"
+
+    return "Unranked"
+
+
+def build_opponent_exposure_summary(h_table, fighter_rank_by_id: dict):
+    """
+    Match_History에서 Opponent 기준 노출도를 집계한다.
+
+    핵심:
+    - total_count: 상대 이름이 전체 Match_History에서 총 몇 번 등장했는가
+    - benchmark_exposure_count: 그 상대가 Champion/Ranked/Gatekeeper 선수의 기록에 몇 번 등장했는가
+    - ranked_exposure_count: 그 상대가 Champion/숫자랭커 선수의 기록에 몇 번 등장했는가
+
+    기존처럼 '이름 2번 보였네?' 수준으로 Gatekeeper를 만들지 않기 위해
+    연결된 상대의 질까지 같이 본다.
+    """
+    summary_map = {}
+
+    for page in h_table.iterate():
+        for r in page:
+            fields = r.get("fields", {})
+            opp_name = str(fields.get("Opponent", "")).strip()
+            fighter_ref = fields.get("Fighter")
+
+            if not opp_name:
+                continue
+
+            key = get_name_key(opp_name)
+            if not key:
+                continue
+
+            if key not in summary_map:
+                summary_map[key] = empty_exposure_summary(display_name=opp_name.title())
+
+            summary_map[key]["total_count"] += 1
+
+            fighter_id = None
+            if isinstance(fighter_ref, list) and fighter_ref:
+                fighter_id = fighter_ref[0]
+            elif isinstance(fighter_ref, str):
+                fighter_id = fighter_ref
+
+            source_rank = fighter_rank_by_id.get(fighter_id, "")
+
+            if is_ranked_or_champion(source_rank) or is_gatekeeper(source_rank):
+                summary_map[key]["benchmark_exposure_count"] += 1
+
+            if is_ranked_or_champion(source_rank):
+                summary_map[key]["ranked_exposure_count"] += 1
+
+    return summary_map
+
+
+def scrape_official_rankings():
+    """
+    공식 UFC 랭킹을 체급별 slot map으로 스크랩
+    반환 형식:
+    {
+      "Flyweight": {
+         "Champion": "Brandon Royval",
+         "1": "...",
+         ...
+      },
+      ...
+    }
     """
     print("\n🌐 [Phase 1] 공식 랭킹 동기화 중...")
 
@@ -123,7 +258,8 @@ def update_official_rankings(f_table):
         time.sleep(3.0)
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        ranked_data = {}
+        ranked_by_class = {}
+        ranking_conflicts = []
 
         weight_class_map = {
             "플라이급": "Flyweight",
@@ -155,150 +291,305 @@ def update_official_rankings(f_table):
                     clean_wc_name = weight_class_map[kr_name]
                     break
 
+            ranked_by_class.setdefault(clean_wc_name, {})
+
             champion_tag = wc_block.select_one("#champion-image-name a") or wc_block.select_one("h5 a")
             if champion_tag:
-                ranked_data[champion_tag.get_text(strip=True)] = {
-                    "weight_class": clean_wc_name,
-                    "rank": "Champion",
-                }
+                champ_name = champion_tag.get_text(strip=True)
+                if "Champion" not in ranked_by_class[clean_wc_name]:
+                    ranked_by_class[clean_wc_name]["Champion"] = champ_name
+                elif ranked_by_class[clean_wc_name]["Champion"] != champ_name:
+                    ranking_conflicts.append(
+                        {
+                            "weight_class": clean_wc_name,
+                            "slot": "Champion",
+                            "existing": ranked_by_class[clean_wc_name]["Champion"],
+                            "incoming": champ_name,
+                            "reason": "duplicate champion slot on source page",
+                        }
+                    )
 
             for row in wc_block.select("tr"):
                 name_tag = row.select_one(".views-field-title a")
                 rank_tag = row.select_one(".views-field-weight-class-rank")
 
-                if name_tag and rank_tag:
-                    ranked_data[name_tag.get_text(strip=True)] = {
-                        "weight_class": clean_wc_name,
-                        "rank": rank_tag.get_text(strip=True),
-                    }
+                if not name_tag or not rank_tag:
+                    continue
+
+                fighter_name = name_tag.get_text(strip=True)
+                rank_text = rank_tag.get_text(strip=True)
+
+                if not str(rank_text).isdigit():
+                    continue
+
+                slot = str(rank_text)
+
+                if slot not in ranked_by_class[clean_wc_name]:
+                    ranked_by_class[clean_wc_name][slot] = fighter_name
+                else:
+                    if ranked_by_class[clean_wc_name][slot] != fighter_name:
+                        ranking_conflicts.append(
+                            {
+                                "weight_class": clean_wc_name,
+                                "slot": slot,
+                                "existing": ranked_by_class[clean_wc_name][slot],
+                                "incoming": fighter_name,
+                                "reason": "duplicate numeric rank slot on source page",
+                            }
+                        )
+
+        return ranked_by_class, ranking_conflicts
 
     finally:
         driver.quit()
 
+
+def update_official_rankings(f_table):
+    """
+    공식 랭킹 동기화
+
+    핵심:
+    1) 체급별 slot map 확보
+    2) 기존 챔피언/숫자 랭커 중 이번 공식 랭킹에 없는 선수는 먼저 Unranked로 내림
+       (이후 Gatekeeper 여부는 Phase 2에서 다시 엄격하게 판정)
+    3) 새 공식 랭킹을 단 한 명씩 배정
+    """
+    ranked_by_class, ranking_conflicts = scrape_official_rankings()
+
+    existing_records = f_table.all()
+
+    print("🧹 기존 랭킹 슬롯 정리 중...")
+
+    demoted_count = 0
+    for rec in existing_records:
+        fields = rec.get("fields", {})
+        current_rank = str(fields.get("Current_Ranking", "")).strip()
+        current_wc = fields.get("Weight_Class", "")
+        current_name = fields.get("Name", "")
+
+        if not is_ranked_or_champion(current_rank):
+            continue
+
+        if current_wc not in ranked_by_class:
+            continue
+
+        official_names_this_wc = list(ranked_by_class[current_wc].values())
+        still_ranked = any(names_match(current_name, official_name) for official_name in official_names_this_wc)
+
+        if not still_ranked:
+            safe_update_fighter(
+                rec["id"],
+                {
+                    "Current_Ranking": "Unranked",
+                    "Validation_Note": "Official ranking refresh demotion -> Unranked (Gatekeeper recheck in Phase 2)",
+                },
+            )
+            demoted_count += 1
+
+    print(f"✅ 기존 랭커 강등 처리 {demoted_count}건 완료")
+
+    print("📌 새 공식 랭킹 배정 중...")
+
+    created_count = 0
+    updated_count = 0
+
     existing_records = f_table.all()
     indexed_records = build_fighter_index(existing_records)
 
-    create_batch = []
-    update_count = 0
+    for weight_class, slot_map in ranked_by_class.items():
+        for slot, fighter_name in slot_map.items():
+            rec = find_existing_record_by_name(fighter_name, indexed_records)
 
-    for ufc_name, data in ranked_data.items():
-        rec = find_existing_record_by_name(ufc_name, indexed_records)
+            if rec:
+                update_payload = {}
 
-        if rec:
-            update_payload = {}
+                if rec.get("ranking", "") != slot:
+                    update_payload["Current_Ranking"] = slot
 
-            if str(rec.get("ranking", "")) != str(data["rank"]):
-                update_payload["Current_Ranking"] = str(data["rank"])
+                if rec.get("weight_class", "") != weight_class:
+                    update_payload["Weight_Class"] = weight_class
 
-            if rec.get("weight_class", "") != data["weight_class"]:
-                update_payload["Weight_Class"] = data["weight_class"]
+                if update_payload:
+                    safe_update_fighter(rec["id"], update_payload)
+                    updated_count += 1
 
-            if update_payload:
-                safe_update_fighter(rec["id"], update_payload)
-                update_count += 1
-        else:
-            create_batch.append(
-                {
-                    "Name": ufc_name,
-                    "Weight_Class": data["weight_class"],
-                    "Current_Ranking": str(data["rank"]),
+            else:
+                payload = {
+                    "Name": fighter_name,
+                    "Weight_Class": weight_class,
+                    "Current_Ranking": slot,
                     "Data_Status": "Verified",
                     "Data_Confidence": 100,
                     "Validation_Note": "Official UFC rankings source",
                 }
+                safe_create_fighter(payload)
+                created_count += 1
+
+    print(f"✅ 신규 랭커 생성 {created_count}건")
+    print(f"✅ 기존 랭커 갱신 {updated_count}건")
+
+    if ranking_conflicts:
+        review_items = []
+        for c in ranking_conflicts:
+            review_items.append(
+                {
+                    "target_name": f"{c['weight_class']} #{c['slot']}",
+                    "expected_weight_class": c["weight_class"],
+                    "context": f"existing={c['existing']} / incoming={c['incoming']}",
+                    "reason": c["reason"],
+                    "candidates": [],
+                }
             )
-
-    if create_batch:
-        for row in create_batch:
-            safe_create_fighter(row)
-        print(f"✅ 신규 랭커 {len(create_batch)}명 추가 완료.")
+        save_review_queue(review_items, "manual_review_queue_rankings.json")
+        print_exception_report(review_items, title="랭킹 소스 충돌 보고서")
     else:
-        print("✅ 신규 진입 랭커 없음.")
-
-    print(f"✅ 기존 랭킹/체급 업데이트 {update_count}건 완료.")
+        print("✅ 랭킹 소스 충돌 없음")
 
 
 def update_gatekeepers_and_missing_stats(f_table, h_table):
     """
-    2. 수문장 탐지 + Prospect/Unranked → Gatekeeper 승격 + 누락 스탯 보강
+    Gatekeeper / Prospect 재분류 전면 수정판
+
+    기존 문제:
+    - Opponent 2회 등장 + UFC 3전 정도면 너무 쉽게 Gatekeeper가 됨
+    - 그래서 Prospect 풀이 거의 사라지고 Gatekeeper가 비정상적으로 폭증함
+
+    수정 후:
+    1) Match_History 노출도(summary)를 먼저 만든다
+    2) 기존 non-ranked 선수 전원을 다시 판정한다
+       - Gatekeeper
+       - Prospect
+       - Unranked
+    3) DB에 없는 이름은 정말 강한 기준을 만족할 때만 신규 Gatekeeper 생성
     """
-    print("\n🔍 [Phase 2] 수문장 탐지 및 지표 수집...")
+    print("\n🔍 [Phase 2] Gatekeeper / Prospect 재분류 중...")
 
-    opp_counts = {}
-    for page in h_table.iterate():
-        for r in page:
-            opp_name = str(r["fields"].get("Opponent", "")).strip()
-            if opp_name:
-                opp_counts[opp_name] = opp_counts.get(opp_name, 0) + 1
+    all_fighters = f_table.all()
+    fighter_rank_by_id = {
+        r["id"]: str(r.get("fields", {}).get("Current_Ranking", "")).strip()
+        for r in all_fighters
+    }
 
-    candidates = [name for name, count in opp_counts.items() if count >= 2]
-    print(f"✅ Gatekeeper 후보 {len(candidates)}명 감지")
+    exposure_map = build_opponent_exposure_summary(h_table, fighter_rank_by_id)
+    print(f"✅ Match_History 상대 노출 요약 {len(exposure_map)}명 집계 완료")
 
-    all_f = f_table.all()
-    existing_index = build_fighter_index(all_f)
+    existing_index = build_fighter_index(all_fighters)
     review_queue = []
 
-    for cand in candidates:
-        matched = find_existing_record_by_name(cand, existing_index)
+    gatekeeper_promotions = 0
+    gatekeeper_creations = 0
+    gatekeeper_demotions = 0
+    prospect_promotions = 0
+    prospect_demotions = 0
 
-        if matched:
-            current_ranking = matched["ranking"]
+    # ------------------------------------------
+    # A. 기존 non-ranked 선수 전원 재분류
+    # ------------------------------------------
+    print("🧹 기존 non-ranked 선수 재분류 중...")
 
-            if is_ranked_or_champion(current_ranking):
-                continue
+    for rec in all_fighters:
+        fields = rec.get("fields", {})
+        current_rank = str(fields.get("Current_Ranking", "")).strip()
+        current_name = fields.get("Name", "")
 
-            update_payload = {}
+        if is_ranked_or_champion(current_rank):
+            continue
 
-            if is_promotable_to_gatekeeper(current_ranking):
-                update_payload["Current_Ranking"] = "Gatekeeper"
-                print(f"   ➔ Gatekeeper 승격: {matched['name']} ({current_ranking} → Gatekeeper)")
+        name_key = get_name_key(current_name)
+        summary = exposure_map.get(name_key, empty_exposure_summary(display_name=current_name))
+        target_rank = get_target_rank_for_nonranked_fighter(fields, summary)
 
-            if not matched.get("url"):
-                resolution = resolve_fighter_identity(
-                    target_name=cand,
-                    expected_weight_class=matched.get("weight_class", ""),
-                    manual_overrides={},
-                )
+        update_payload = {}
 
-                if resolution["status"] == "verified":
-                    profile = resolution["profile"]
-                    update_payload["UFC_Stats_URL"] = profile.get("UFC_Stats_URL")
-                    update_payload["Data_Status"] = "Verified"
-                    update_payload["Data_Confidence"] = int(resolution.get("confidence", 0))
-                    update_payload["Validation_Note"] = f"Gatekeeper URL resolve | {resolution['note']}"
-                    print(f"   ➔ UFC URL 보강: {matched['name']}")
-                else:
-                    review_queue.append(
-                        {
-                            "target_name": cand,
-                            "expected_weight_class": matched.get("weight_class", ""),
-                            "context": f"Gatekeeper candidate / existing={matched['name']}",
-                            "reason": resolution["note"],
-                            "candidates": [
-                                {
-                                    "candidate_name": c.get("candidate_name", ""),
-                                    "weight_class": c.get("weight_class", ""),
-                                    "url": c.get("url", ""),
-                                    "score": c.get("score", 0),
-                                }
-                                for c in resolution.get("candidates", [])
-                            ],
-                        }
-                    )
+        if current_rank != target_rank:
+            update_payload["Current_Ranking"] = target_rank
 
-            if update_payload:
-                safe_update_fighter(matched["id"], update_payload)
+            note = (
+                f"Reclassified | total={summary['total_count']} | "
+                f"benchmark={summary['benchmark_exposure_count']} | "
+                f"ranked={summary['ranked_exposure_count']} | "
+                f"UFC_Fights={safe_int(fields.get('UFC_Fights', 0), 0)}"
+            )
+            update_payload["Validation_Note"] = note
 
-        else:
+            if current_rank == "Gatekeeper" and target_rank != "Gatekeeper":
+                gatekeeper_demotions += 1
+
+            if current_rank != "Gatekeeper" and target_rank == "Gatekeeper":
+                gatekeeper_promotions += 1
+
+            if current_rank != "Prospect" and target_rank == "Prospect":
+                prospect_promotions += 1
+
+            if current_rank == "Prospect" and target_rank != "Prospect":
+                prospect_demotions += 1
+
+        # Gatekeeper로 남는/올라가는 선수는 URL 보강 시도
+        if target_rank == "Gatekeeper" and not fields.get("UFC_Stats_URL"):
             resolution = resolve_fighter_identity(
-                target_name=cand,
-                expected_weight_class=None,
+                target_name=current_name,
+                expected_weight_class=fields.get("Weight_Class", ""),
                 manual_overrides={},
             )
 
             if resolution["status"] == "verified":
                 profile = resolution["profile"]
+                update_payload["UFC_Stats_URL"] = profile.get("UFC_Stats_URL")
+                update_payload["Data_Status"] = "Verified"
+                update_payload["Data_Confidence"] = int(resolution.get("confidence", 0))
+            else:
+                review_queue.append(
+                    {
+                        "target_name": current_name,
+                        "expected_weight_class": fields.get("Weight_Class", ""),
+                        "context": f"Existing fighter / target_rank={target_rank}",
+                        "reason": resolution["note"],
+                        "candidates": [
+                            {
+                                "candidate_name": c.get("candidate_name", ""),
+                                "weight_class": c.get("weight_class", ""),
+                                "url": c.get("url", ""),
+                                "score": c.get("score", 0),
+                            }
+                            for c in resolution.get("candidates", [])
+                        ],
+                    }
+                )
 
+        if update_payload:
+            safe_update_fighter(rec["id"], update_payload)
+
+    # ------------------------------------------
+    # B. DB에 없는 이름은 정말 강한 기준일 때만 신규 Gatekeeper 생성
+    # ------------------------------------------
+    print("➕ 신규 Gatekeeper 생성 후보 엄격 검증 중...")
+
+    for key, summary in exposure_map.items():
+        if not qualifies_gatekeeper(summary, GATEKEEPER_MIN_UFC_FIGHTS):
+            # 이 줄은 "대충 자주 보인 선수"를 후보에서 미리 걸러내기 위한 빠른 차단이 아님
+            # 아래에서 진짜 UFC_Fights를 profile 기준으로 다시 확인해야 하므로
+            # 여기서는 넘어가지 않는다.
+            pass
+
+        cand = summary["display_name"]
+        matched = find_existing_record_by_name(cand, existing_index)
+
+        if matched:
+            continue
+
+        # 이름은 Match_History에서 많이 보였지만 DB에는 없는 선수
+        # → identity resolve 후 profile의 UFC_Fights로 최종 판정
+        resolution = resolve_fighter_identity(
+            target_name=cand,
+            expected_weight_class=None,
+            manual_overrides={},
+        )
+
+        if resolution["status"] == "verified":
+            profile = resolution["profile"]
+            ufc_fights = safe_int(profile.get("UFC_Fights", 0), 0)
+
+            if qualifies_gatekeeper(summary, ufc_fights):
                 payload = {
                     "Name": cand.title(),
                     "Current_Ranking": "Gatekeeper",
@@ -318,16 +609,37 @@ def update_gatekeepers_and_missing_stats(f_table, h_table):
                     "UFC_Fights": profile.get("UFC_Fights"),
                     "Data_Status": "Verified",
                     "Data_Confidence": int(resolution.get("confidence", 0)),
-                    "Validation_Note": f"New Gatekeeper create | {resolution['note']}",
+                    "Validation_Note": (
+                        f"New Gatekeeper create | total={summary['total_count']} | "
+                        f"benchmark={summary['benchmark_exposure_count']} | "
+                        f"ranked={summary['ranked_exposure_count']} | "
+                        f"UFC_Fights={ufc_fights}"
+                    ),
                 }
                 safe_create_fighter(payload)
-                print(f"   ➔ 신규 Gatekeeper 생성: {cand.title()}")
-            else:
+                gatekeeper_creations += 1
+                print(
+                    f"   ➔ 신규 Gatekeeper 생성: {cand.title()} "
+                    f"(total={summary['total_count']}, benchmark={summary['benchmark_exposure_count']}, "
+                    f"ranked={summary['ranked_exposure_count']}, UFC_Fights={ufc_fights})"
+                )
+        else:
+            # 정말 유력한 후보만 review queue로 남긴다
+            # 너무 많은 쓰레기 후보가 큐를 오염시키지 않도록 필터
+            rough_total = summary.get("total_count", 0)
+            rough_benchmark = summary.get("benchmark_exposure_count", 0)
+            rough_ranked = summary.get("ranked_exposure_count", 0)
+
+            if (
+                rough_total >= GATEKEEPER_TOTAL_EXPOSURE_THRESHOLD
+                and rough_benchmark >= GATEKEEPER_BENCHMARK_EXPOSURE_THRESHOLD
+                and rough_ranked >= GATEKEEPER_RANKED_EXPOSURE_THRESHOLD
+            ):
                 review_queue.append(
                     {
                         "target_name": cand,
                         "expected_weight_class": "",
-                        "context": "New gatekeeper candidate",
+                        "context": "New strict gatekeeper candidate",
                         "reason": resolution["note"],
                         "candidates": [
                             {
@@ -341,10 +653,28 @@ def update_gatekeepers_and_missing_stats(f_table, h_table):
                     }
                 )
 
-    # 누락 스탯 보강
+    print(f"✅ Gatekeeper 신규 승격 {gatekeeper_promotions}건")
+    print(f"✅ Gatekeeper 신규 생성 {gatekeeper_creations}건")
+    print(f"✅ Gatekeeper 강등 {gatekeeper_demotions}건")
+    print(f"✅ Prospect 승격 {prospect_promotions}건")
+    print(f"✅ Prospect 강등 {prospect_demotions}건")
+
+    # ------------------------------------------
+    # C. 누락 스탯 보강
+    # ------------------------------------------
+    print("🧩 누락 스탯 보강 중...")
+
     required = [
-        "Str_Acc", "Str_Def", "TD_Acc", "TD_Def", "Sub_Avg",
-        "Weight_Class", "Age", "Reach", "Height", "UFC_Fights"
+        "Str_Acc",
+        "Str_Def",
+        "TD_Acc",
+        "TD_Def",
+        "Sub_Avg",
+        "Weight_Class",
+        "Age",
+        "Reach",
+        "Height",
+        "UFC_Fights",
     ]
 
     for f in f_table.all():
@@ -413,10 +743,12 @@ def update_gatekeepers_and_missing_stats(f_table, h_table):
 
 def recalculate_z_scores(f_table, h_table):
     """
-    3. 체급별 Proxy Z-Score 및 Match_History 기반 최종 True Z-Score 업데이트
-    - Prospect 제외
-    - Unranked 제외
-    - Champion / 숫자랭커 / Gatekeeper 기준 평균
+    benchmark는 Champion + 숫자랭커 + Gatekeeper
+    Prospect / Unranked는 제외
+
+    단, benchmark 평균/표준편차 계산에서만
+    최근 경기일이 730일 초과한 선수는 제외한다.
+    (DB 삭제/강등 아님)
     """
     print("\n📊 [Phase 3] Proxy 및 최종 True Z-Score 이중 연산 시작...")
 
@@ -427,13 +759,54 @@ def recalculate_z_scores(f_table, h_table):
         print("❌ Fighters 테이블이 비어 있어 Z-Score 계산 중단")
         return
 
+    # ------------------------------------------
+    # 최근 경기일 계산 (Match_History 기준)
+    # ------------------------------------------
+    if not df_h.empty and "Fighter" in df_h.columns and "Date" in df_h.columns:
+        df_h["f_id"] = df_h["Fighter"].apply(lambda x: x[0] if isinstance(x, list) and x else x)
+        df_h["Date_dt"] = pd.to_datetime(df_h["Date"], errors="coerce")
+
+        last_fight_df = (
+            df_h.groupby("f_id", as_index=False)["Date_dt"]
+            .max()
+            .rename(columns={"Date_dt": "Last_Fight_Date"})
+        )
+
+        df_f = df_f.merge(last_fight_df, left_on="record_id", right_on="f_id", how="left")
+    else:
+        df_f["Last_Fight_Date"] = pd.NaT
+
+    today = pd.Timestamp.utcnow().tz_localize(None).normalize()
+    df_f["Days_Since_Last_Fight"] = np.where(
+        df_f["Last_Fight_Date"].notna(),
+        (today - pd.to_datetime(df_f["Last_Fight_Date"], errors="coerce")).dt.days,
+        np.nan,
+    )
+
+    df_f["Exclude_From_Benchmark"] = (
+        df_f["Last_Fight_Date"].notna()
+        & (pd.to_numeric(df_f["Days_Since_Last_Fight"], errors="coerce") > BENCHMARK_RECENCY_DAYS)
+    )
+
     print(" 🔄 Proxy Z-Score 계산 중...")
 
-    elite_f = df_f[
+    elite_mask = (
         df_f["Current_Ranking"].notna()
         & (df_f["Current_Ranking"] != "Unranked")
         & (df_f["Current_Ranking"] != "Prospect")
-    ].copy()
+    )
+
+    benchmark_mask = elite_mask & (~df_f["Exclude_From_Benchmark"])
+    elite_f = df_f[benchmark_mask].copy()
+
+    if elite_f.empty:
+        print(" ⚠️ 최근 활동 benchmark가 비어 있어 비활동 필터 없이 fallback")
+        elite_f = df_f[elite_mask].copy()
+
+    print(
+        f" ✅ benchmark 모수: {len(elite_f)}명 "
+        f"(비활동 제외 {int(df_f['Exclude_From_Benchmark'].sum())}명)"
+    )
 
     proxy_map = {
         "SLpM": "z_slpm",
@@ -461,7 +834,7 @@ def recalculate_z_scores(f_table, h_table):
     print(" 🔄 Match_History 보정 데이터(True Stat) 집계 중...")
 
     if not df_h.empty and "Fighter" in df_h.columns:
-        df_h["f_id"] = df_h["Fighter"].apply(lambda x: x[0] if isinstance(x, list) else x)
+        df_h["f_id"] = df_h["Fighter"].apply(lambda x: x[0] if isinstance(x, list) and x else x)
 
         required_cols = [
             "True_Str_Landed",
@@ -491,16 +864,14 @@ def recalculate_z_scores(f_table, h_table):
             "True_Str_Defended": "True_z_str_def",
         }
 
+        active_elite_t = df_f[benchmark_mask].copy()
+        if active_elite_t.empty:
+            active_elite_t = df_f[elite_mask].copy()
+
         for t_raw, t_z in true_z_map.items():
-            elite_t = df_f[
-                df_f["Current_Ranking"].notna()
-                & (df_f["Current_Ranking"] != "Unranked")
-                & (df_f["Current_Ranking"] != "Prospect")
-            ].copy()
+            active_elite_t[t_raw] = pd.to_numeric(active_elite_t.get(t_raw), errors="coerce")
 
-            elite_t[t_raw] = pd.to_numeric(elite_t.get(t_raw), errors="coerce")
-
-            t_stats = elite_t.groupby("Weight_Class")[t_raw].agg(m="mean", s="std").reset_index()
+            t_stats = active_elite_t.groupby("Weight_Class")[t_raw].agg(m="mean", s="std").reset_index()
             df_f = df_f.merge(t_stats, on="Weight_Class", how="left", suffixes=("", "_tmp"))
 
             df_f[t_z] = np.where(
@@ -535,3 +906,17 @@ def recalculate_z_scores(f_table, h_table):
         f_table.batch_update(update_batch[i:i + 10])
 
     print(f"✅ 총 {len(update_batch)}명 Proxy & 최종 True Z-Score 업데이트 완료!")
+
+
+def main():
+    print("🔥 [마스터 파이프라인] UFC 데이터 통합 업데이트 시작...")
+
+    update_official_rankings(f_table)
+    update_gatekeepers_and_missing_stats(f_table, h_table)
+    recalculate_z_scores(f_table, h_table)
+
+    print("\n🏆 모든 데이터 파이프라인 실행 완료! 완벽하게 최신화되었습니다.")
+
+
+if __name__ == "__main__":
+    main()
