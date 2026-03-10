@@ -1,0 +1,30 @@
+name: Sunday UFC Result Settlement
+
+on:
+  schedule:
+    - cron: '0 8 * * 0'   # 일요일 UTC 08:00 (한국 시간 오후 5시)
+  workflow_dispatch:
+
+jobs:
+  settle-results:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 세팅
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: 패키지 설치
+        run: pip install -r requirements.txt
+
+      - name: 일요일 ROI 정산 봇 실행
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          AIRTABLE_TOKEN: ${{ secrets.AIRTABLE_TOKEN }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+          DIFY_API_KEY: ${{ secrets.DIFY_API_KEY }}
+        run: |
+          python Result_Updater.py
